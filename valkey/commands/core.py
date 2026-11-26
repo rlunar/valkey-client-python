@@ -2780,6 +2780,55 @@ class BasicKeyCommands(CommandsProtocol):
         self.delete(name)
 
     @overload
+    def delex(
+        self: SyncClientProtocol,
+        name: KeyT,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
+    ) -> int: ...
+
+    @overload
+    def delex(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
+    ) -> Awaitable[int]: ...
+
+    def delex(
+        self,
+        name: KeyT,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
+    ) -> int | Awaitable[int]:
+        """Delete the string key ``name`` if its value meets a condition.
+
+        Exactly one of ``ifeq`` and ``ifne`` must be given. A missing key is
+        never deleted, whichever condition is used.
+
+        Args:
+            name: The key to delete.
+            ifeq: Delete the key only if its value is equal to ``ifeq``.
+            ifne: Delete the key only if its value is not equal to ``ifne``.
+
+        Returns:
+            1 if the key was deleted, 0 otherwise.
+
+        Raises:
+            DataError: If neither or both of ``ifeq`` and ``ifne`` are given.
+            ResponseError: If the key holds a value that is not a string.
+
+        Requires Valkey 9.2 or newer.
+
+        For more information see https://valkey.io/commands/delex
+        """
+        if (ifeq is None) == (ifne is None):
+            raise DataError("Exactly one of ``ifeq`` and ``ifne`` must be given.")
+        if ifeq is not None:
+            return self.execute_command("DELEX", name, "IFEQ", ifeq)
+        return self.execute_command("DELEX", name, "IFNE", ifne)
+
+    @overload
     def dump(self: SyncClientProtocol, name: KeyT) -> StringTypeT | None: ...
 
     @overload
@@ -3739,6 +3788,8 @@ class BasicKeyCommands(CommandsProtocol):
         get: bool = False,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
     ) -> bool | StringTypeT | None: ...
 
     @overload
@@ -3754,6 +3805,8 @@ class BasicKeyCommands(CommandsProtocol):
         get: bool = False,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
     ) -> Awaitable[bool | StringTypeT | None]: ...
 
     def set(
@@ -3768,6 +3821,8 @@ class BasicKeyCommands(CommandsProtocol):
         get: bool = False,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
+        ifeq: EncodableT | None = None,
+        ifne: EncodableT | None = None,
     ) -> bool | StringTypeT | None | Awaitable[bool | StringTypeT | None]:
         """
         Set the value at key ``name`` to ``value``
@@ -3793,12 +3848,27 @@ class BasicKeyCommands(CommandsProtocol):
         ``pxat`` sets an expire flag on key ``name`` for ``ex`` milliseconds,
             specified in unix time.
 
+        ``ifeq`` if set, set the value at key ``name`` to ``value`` only if
+            its current value is equal to ``ifeq``. A missing key is not
+            created. Requires Valkey 8.1 or newer.
+
+        ``ifne`` if set, set the value at key ``name`` to ``value`` only if
+            its current value is not equal to ``ifne``. A missing key is
+            created. Requires Valkey 9.2 or newer.
+
+        ``nx``, ``xx``, ``ifeq`` and ``ifne`` are mutually exclusive.
+
         For more information see https://valkey.io/commands/set
         """
         params = sum(op is not None for op in [ex, px, exat, pxat])
         if params > 1:
             raise DataError(
                 "``ex``, ``px``, ``exat`` and ``pxat`` are mutually exclusive."
+            )
+        conditions = sum([nx, xx, ifeq is not None, ifne is not None])
+        if conditions > 1:
+            raise DataError(
+                "``nx``, ``xx``, ``ifeq`` and ``ifne`` are mutually exclusive."
             )
         pieces: list[EncodableT] = [name, value]
         options = {}
@@ -3835,8 +3905,12 @@ class BasicKeyCommands(CommandsProtocol):
 
         if nx:
             pieces.append("NX")
-        if xx:
+        elif xx:
             pieces.append("XX")
+        elif ifeq is not None:
+            pieces.extend(("IFEQ", ifeq))
+        elif ifne is not None:
+            pieces.extend(("IFNE", ifne))
 
         if get:
             pieces.append("GET")

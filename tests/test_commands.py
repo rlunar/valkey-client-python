@@ -1206,6 +1206,36 @@ class TestValkeyCommands:
         assert r.get("a") is None
         assert r.get("b") is None
 
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_ifeq(self, r):
+        assert r.delex("a", ifeq="foo") == 0
+        r["a"] = "foo"
+        assert r.delex("a", ifeq="bar") == 0
+        assert r.get("a") == b"foo"
+        assert r.delex("a", ifeq="foo") == 1
+        assert r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_ifne(self, r):
+        assert r.delex("a", ifne="foo") == 0
+        r["a"] = "foo"
+        assert r.delex("a", ifne="foo") == 0
+        assert r.get("a") == b"foo"
+        assert r.delex("a", ifne="bar") == 1
+        assert r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_wrong_type(self, r):
+        r.rpush("a", "foo")
+        with pytest.raises(exceptions.ResponseError):
+            r.delex("a", ifeq="foo")
+
+    def test_delex_requires_one_condition(self, r):
+        with pytest.raises(exceptions.DataError):
+            r.delex("a")
+        with pytest.raises(exceptions.DataError):
+            r.delex("a", ifeq="foo", ifne="bar")
+
     def test_delitem(self, r):
         r["a"] = "foo"
         del r["a"]
@@ -1793,6 +1823,50 @@ class TestValkeyCommands:
         assert r.set("a", "foo") is True
         assert r.set("a", "bar", get=True) == b"foo"
         assert r.get("a") == b"bar"
+
+    def test_set_conditions_mutually_exclusive(self, r):
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", nx=True, xx=True)
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", nx=True, ifeq="0")
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", xx=True, ifne="0")
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", ifeq="0", ifne="0")
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq(self, r):
+        assert r.set("a", "1", ifeq="0") is None
+        assert r.get("a") is None
+        r["a"] = "1"
+        assert r.set("a", "2", ifeq="0") is None
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifeq="1") is True
+        assert r.get("a") == b"2"
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq_get_and_expiry(self, r):
+        r["a"] = "1"
+        assert r.set("a", "2", ifeq="0", get=True) == b"1"
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifeq="1", get=True, ex=10) == b"1"
+        assert r.get("a") == b"2"
+        assert 0 < r.ttl("a") <= 10
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq_wrong_type(self, r):
+        r.rpush("a", "1")
+        with pytest.raises(exceptions.ResponseError):
+            r.set("a", "2", ifeq="1")
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_set_ifne(self, r):
+        assert r.set("a", "1", ifne="0") is True
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifne="1") is None
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifne="0") is True
+        assert r.get("a") == b"2"
 
     def test_setex(self, r):
         assert r.setex("a", 60, "1")
