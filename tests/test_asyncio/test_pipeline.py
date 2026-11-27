@@ -58,7 +58,14 @@ class TestPipeline:
             assert await r.get("c") == b"c1"
 
     @skip_if_server_version_lt("9.2.0")
-    @pytest.mark.parametrize("transaction", [True, False])
+    @pytest.mark.parametrize(
+        "transaction",
+        [
+            # Cluster pipelines do not support transaction=True.
+            pytest.param(True, marks=pytest.mark.onlynoncluster),
+            False,
+        ],
+    )
     async def test_pipeline_conditional_set_and_delex(self, r, transaction):
         async with r.pipeline(transaction=transaction) as pipe:
             (
