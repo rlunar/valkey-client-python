@@ -117,6 +117,78 @@ class TestResponseCallbacks:
         assert r.response_callbacks["ping"] == r.response_callbacks["PING"]
 
 
+class TestConditionalStringCommandsUnit:
+    """Server-free tests for the arguments SET and DELEX send.
+
+    ``execute_command`` is mocked, so no connection is ever opened.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        client = valkey.Valkey()
+        execute_command = mock.AsyncMock()
+        with mock.patch.object(client, "execute_command", execute_command):
+            yield client, execute_command
+
+    async def test_set_ifeq_args(self, client):
+        c, execute_command = client
+        await c.set("k", "new", ifeq="old")
+        execute_command.assert_awaited_once_with("SET", "k", "new", "IFEQ", "old")
+
+    async def test_set_ifne_args(self, client):
+        c, execute_command = client
+        await c.set("k", "new", ifne="old")
+        execute_command.assert_awaited_once_with("SET", "k", "new", "IFNE", "old")
+
+    async def test_set_ifeq_with_expiry_and_get(self, client):
+        c, execute_command = client
+        await c.set(
+            "k", "new", ex=datetime.timedelta(seconds=10), ifeq=b"old", get=True
+        )
+        execute_command.assert_awaited_once_with(
+            "SET", "k", "new", "EX", 10, "IFEQ", b"old", "GET", get=True
+        )
+
+    async def test_set_positional_arguments_unchanged(self, client):
+        c, execute_command = client
+        await c.set("k", "v", 10, None, True)
+        execute_command.assert_awaited_once_with("SET", "k", "v", "EX", 10, "NX")
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            {"nx": True, "xx": True},
+            {"nx": True, "ifeq": "a"},
+            {"nx": True, "ifne": "a"},
+            {"xx": True, "ifeq": "a"},
+            {"xx": True, "ifne": "a"},
+            {"ifeq": "a", "ifne": "b"},
+        ],
+    )
+    async def test_set_conflicting_conditions_not_sent(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="mutually exclusive"):
+            await c.set("k", "v", **conditions)
+        execute_command.assert_not_called()
+
+    async def test_delex_ifeq_args(self, client):
+        c, execute_command = client
+        await c.delex("k", ifeq="v")
+        execute_command.assert_awaited_once_with("DELEX", "k", "IFEQ", "v")
+
+    async def test_delex_ifne_args(self, client):
+        c, execute_command = client
+        await c.delex("k", ifne=b"v")
+        execute_command.assert_awaited_once_with("DELEX", "k", "IFNE", b"v")
+
+    @pytest.mark.parametrize("conditions", [{}, {"ifeq": "a", "ifne": "b"}])
+    async def test_delex_requires_exactly_one_condition(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="Exactly one"):
+            await c.delex("k", **conditions)
+        execute_command.assert_not_called()
+
+
 class TestValkeyCommands:
     async def test_command_on_invalid_key_type(self, r: valkey.Valkey):
         await r.lpush("a", "1")

@@ -57,6 +57,55 @@ class TestPipeline:
             assert r["b"] == b"b1"
             assert r["c"] == b"c1"
 
+    @skip_if_server_version_lt("9.2.0")
+    @pytest.mark.parametrize("transaction", [True, False])
+    def test_pipeline_conditional_set_and_delex(self, r, transaction):
+        with r.pipeline(transaction=transaction) as pipe:
+            (
+                pipe.set("a", "v1")
+                .set("a", "v2", ifeq="v1")
+                .set("a", "x", ifeq="nope")
+                .set("a", "x", ifne="v2", get=True)
+                .set("a", "v3", ifne="nope", get=True)
+                .delex("a", ifne="v3")
+                .delex("a", ifeq="v3")
+                .get("a")
+            )
+            assert pipe.execute() == [
+                True,  # plain SET
+                True,  # IFEQ matched
+                None,  # IFEQ did not match
+                b"v2",  # IFNE did not match; GET still returns the value
+                b"v2",  # IFNE matched; GET returns the previous value
+                0,  # DELEX IFNE: value is v3, so nothing is deleted
+                1,  # DELEX IFEQ: deleted
+                None,
+            ]
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_pipeline_delex_wrong_type_error_in_response(self, r):
+        r.rpush("c", "v")
+        with r.pipeline(transaction=False) as pipe:
+            pipe.set("a", "v1").delex("c", ifeq="v").delex("a", ifeq="v1")
+            result = pipe.execute(raise_on_error=False)
+
+        assert result[0] is True
+        assert isinstance(result[1], valkey.ResponseError)
+        assert "WRONGTYPE" in str(result[1])
+        assert result[2] == 1
+        assert r.lrange("c", 0, -1) == [b"v"]
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_releases_lock_only_for_its_owner(self, r):
+        # Compare-and-delete, the main use case for DELEX: only the client
+        # holding the token may release the lock.
+        assert r.set("lock", "token-a", nx=True, px=10000) is True
+        assert r.set("lock", "token-b", nx=True, px=10000) is None
+        assert r.delex("lock", ifeq="token-b") == 0
+        assert r.get("lock") == b"token-a"
+        assert r.delex("lock", ifeq="token-a") == 1
+        assert r.set("lock", "token-b", nx=True, px=10000) is True
+
     @pytest.mark.onlynoncluster
     def test_pipeline_no_transaction_watch(self, r):
         r["a"] = 0

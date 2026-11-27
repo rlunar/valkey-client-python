@@ -88,6 +88,105 @@ class TestResponseCallbacks:
         assert r.response_callbacks["ping"] == r.response_callbacks["PING"]
 
 
+class TestConditionalStringCommandsUnit:
+    """Server-free tests for the arguments SET and DELEX send.
+
+    ``execute_command`` is mocked, so no connection is ever opened.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        client = valkey.Valkey()
+        with mock.patch.object(client, "execute_command") as execute_command:
+            yield client, execute_command
+
+    def test_set_ifeq_args(self, client):
+        c, execute_command = client
+        c.set("k", "new", ifeq="old")
+        execute_command.assert_called_once_with("SET", "k", "new", "IFEQ", "old")
+
+    def test_set_ifne_args(self, client):
+        c, execute_command = client
+        c.set("k", "new", ifne="old")
+        execute_command.assert_called_once_with("SET", "k", "new", "IFNE", "old")
+
+    def test_set_ifeq_with_expiry_and_get(self, client):
+        c, execute_command = client
+        c.set("k", "new", ex=datetime.timedelta(seconds=10), ifeq=b"old", get=True)
+        execute_command.assert_called_once_with(
+            "SET", "k", "new", "EX", 10, "IFEQ", b"old", "GET", get=True
+        )
+
+    def test_set_comparison_value_passed_unchanged(self, client):
+        c, execute_command = client
+        c.set("k", 2, ifeq=1)
+        execute_command.assert_called_once_with("SET", "k", 2, "IFEQ", 1)
+
+    def test_set_positional_arguments_unchanged(self, client):
+        # ifeq/ifne are appended after pxat, so positional callers keep working.
+        c, execute_command = client
+        c.set("k", "v", 10, None, True)
+        execute_command.assert_called_once_with("SET", "k", "v", "EX", 10, "NX")
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            {"nx": True, "xx": True},
+            {"nx": True, "ifeq": "a"},
+            {"nx": True, "ifne": "a"},
+            {"xx": True, "ifeq": "a"},
+            {"xx": True, "ifne": "a"},
+            {"ifeq": "a", "ifne": "b"},
+        ],
+    )
+    def test_set_conflicting_conditions_not_sent(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="mutually exclusive"):
+            c.set("k", "v", **conditions)
+        execute_command.assert_not_called()
+
+    def test_set_empty_comparison_value_is_sent(self, client):
+        # An empty string is a valid comparison value, unlike None.
+        c, execute_command = client
+        c.set("k", "v", ifeq="")
+        execute_command.assert_called_once_with("SET", "k", "v", "IFEQ", "")
+
+    def test_delex_ifeq_args(self, client):
+        c, execute_command = client
+        c.delex("k", ifeq="v")
+        execute_command.assert_called_once_with("DELEX", "k", "IFEQ", "v")
+
+    def test_delex_ifne_args(self, client):
+        c, execute_command = client
+        c.delex("k", ifne=b"v")
+        execute_command.assert_called_once_with("DELEX", "k", "IFNE", b"v")
+
+    def test_delex_empty_comparison_value_is_sent(self, client):
+        c, execute_command = client
+        c.delex("k", ifeq="")
+        execute_command.assert_called_once_with("DELEX", "k", "IFEQ", "")
+
+    @pytest.mark.parametrize("conditions", [{}, {"ifeq": "a", "ifne": "b"}])
+    def test_delex_requires_exactly_one_condition(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="Exactly one"):
+            c.delex("k", **conditions)
+        execute_command.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response, options, expected",
+        [
+            (b"OK", {}, True),
+            (None, {}, None),  # condition not met
+            (b"old", {"get": True}, b"old"),  # GET returns the previous value
+            (None, {"get": True}, None),
+        ],
+    )
+    def test_set_reply_parsing(self, response, options, expected):
+        callback = _ValkeyCallbacks["SET"]
+        assert callback(response, **options) == expected
+
+
 class TestValkeyCommands:
     @pytest.mark.onlynoncluster
     @pytest.mark.standalone_exclusive
