@@ -117,6 +117,78 @@ class TestResponseCallbacks:
         assert r.response_callbacks["ping"] == r.response_callbacks["PING"]
 
 
+class TestConditionalStringCommandsUnit:
+    """Server-free tests for the arguments SET and DELEX send.
+
+    ``execute_command`` is mocked, so no connection is ever opened.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        client = valkey.Valkey()
+        execute_command = mock.AsyncMock()
+        with mock.patch.object(client, "execute_command", execute_command):
+            yield client, execute_command
+
+    async def test_set_ifeq_args(self, client):
+        c, execute_command = client
+        await c.set("k", "new", ifeq="old")
+        execute_command.assert_awaited_once_with("SET", "k", "new", "IFEQ", "old")
+
+    async def test_set_ifne_args(self, client):
+        c, execute_command = client
+        await c.set("k", "new", ifne="old")
+        execute_command.assert_awaited_once_with("SET", "k", "new", "IFNE", "old")
+
+    async def test_set_ifeq_with_expiry_and_get(self, client):
+        c, execute_command = client
+        await c.set(
+            "k", "new", ex=datetime.timedelta(seconds=10), ifeq=b"old", get=True
+        )
+        execute_command.assert_awaited_once_with(
+            "SET", "k", "new", "EX", 10, "IFEQ", b"old", "GET", get=True
+        )
+
+    async def test_set_positional_arguments_unchanged(self, client):
+        c, execute_command = client
+        await c.set("k", "v", 10, None, True)
+        execute_command.assert_awaited_once_with("SET", "k", "v", "EX", 10, "NX")
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            {"nx": True, "xx": True},
+            {"nx": True, "ifeq": "a"},
+            {"nx": True, "ifne": "a"},
+            {"xx": True, "ifeq": "a"},
+            {"xx": True, "ifne": "a"},
+            {"ifeq": "a", "ifne": "b"},
+        ],
+    )
+    async def test_set_conflicting_conditions_not_sent(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="mutually exclusive"):
+            await c.set("k", "v", **conditions)
+        execute_command.assert_not_called()
+
+    async def test_delex_ifeq_args(self, client):
+        c, execute_command = client
+        await c.delex("k", ifeq="v")
+        execute_command.assert_awaited_once_with("DELEX", "k", "IFEQ", "v")
+
+    async def test_delex_ifne_args(self, client):
+        c, execute_command = client
+        await c.delex("k", ifne=b"v")
+        execute_command.assert_awaited_once_with("DELEX", "k", "IFNE", b"v")
+
+    @pytest.mark.parametrize("conditions", [{}, {"ifeq": "a", "ifne": "b"}])
+    async def test_delex_requires_exactly_one_condition(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="Exactly one"):
+            await c.delex("k", **conditions)
+        execute_command.assert_not_called()
+
+
 class TestValkeyCommands:
     async def test_command_on_invalid_key_type(self, r: valkey.Valkey):
         await r.lpush("a", "1")
@@ -828,6 +900,36 @@ class TestValkeyCommands:
         assert await r.get("a") is None
         assert await r.get("b") is None
 
+    @skip_if_server_version_lt("9.2.0")
+    async def test_delex_ifeq(self, r: valkey.Valkey):
+        assert await r.delex("a", ifeq="foo") == 0
+        await r.set("a", "foo")
+        assert await r.delex("a", ifeq="bar") == 0
+        assert await r.get("a") == b"foo"
+        assert await r.delex("a", ifeq="foo") == 1
+        assert await r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    async def test_delex_ifne(self, r: valkey.Valkey):
+        assert await r.delex("a", ifne="foo") == 0
+        await r.set("a", "foo")
+        assert await r.delex("a", ifne="foo") == 0
+        assert await r.get("a") == b"foo"
+        assert await r.delex("a", ifne="bar") == 1
+        assert await r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    async def test_delex_wrong_type(self, r: valkey.Valkey):
+        await r.rpush("a", "foo")
+        with pytest.raises(exceptions.ResponseError):
+            await r.delex("a", ifeq="foo")
+
+    async def test_delex_requires_one_condition(self, r: valkey.Valkey):
+        with pytest.raises(exceptions.DataError):
+            await r.delex("a")
+        with pytest.raises(exceptions.DataError):
+            await r.delex("a", ifeq="foo", ifne="bar")
+
     async def test_delitem(self, r: valkey.Valkey):
         await r.set("a", "foo")
         await r.delete("a")
@@ -1163,6 +1265,50 @@ class TestValkeyCommands:
         await r.set("a", "2", keepttl=True)
         assert await r.get("a") == b"2"
         assert 0 < await r.ttl("a") <= 10
+
+    async def test_set_conditions_mutually_exclusive(self, r: valkey.Valkey):
+        with pytest.raises(exceptions.DataError):
+            await r.set("a", "1", nx=True, xx=True)
+        with pytest.raises(exceptions.DataError):
+            await r.set("a", "1", nx=True, ifeq="0")
+        with pytest.raises(exceptions.DataError):
+            await r.set("a", "1", xx=True, ifne="0")
+        with pytest.raises(exceptions.DataError):
+            await r.set("a", "1", ifeq="0", ifne="0")
+
+    @skip_if_server_version_lt("8.1.0")
+    async def test_set_ifeq(self, r: valkey.Valkey):
+        assert await r.set("a", "1", ifeq="0") is None
+        assert await r.get("a") is None
+        await r.set("a", "1")
+        assert await r.set("a", "2", ifeq="0") is None
+        assert await r.get("a") == b"1"
+        assert await r.set("a", "2", ifeq="1") is True
+        assert await r.get("a") == b"2"
+
+    @skip_if_server_version_lt("8.1.0")
+    async def test_set_ifeq_get_and_expiry(self, r: valkey.Valkey):
+        await r.set("a", "1")
+        assert await r.set("a", "2", ifeq="0", get=True) == b"1"
+        assert await r.get("a") == b"1"
+        assert await r.set("a", "2", ifeq="1", get=True, ex=10) == b"1"
+        assert await r.get("a") == b"2"
+        assert 0 < await r.ttl("a") <= 10
+
+    @skip_if_server_version_lt("8.1.0")
+    async def test_set_ifeq_wrong_type(self, r: valkey.Valkey):
+        await r.rpush("a", "1")
+        with pytest.raises(exceptions.ResponseError):
+            await r.set("a", "2", ifeq="1")
+
+    @skip_if_server_version_lt("9.2.0")
+    async def test_set_ifne(self, r: valkey.Valkey):
+        assert await r.set("a", "1", ifne="0") is True
+        assert await r.get("a") == b"1"
+        assert await r.set("a", "2", ifne="1") is None
+        assert await r.get("a") == b"1"
+        assert await r.set("a", "2", ifne="0") is True
+        assert await r.get("a") == b"2"
 
     async def test_setex(self, r: valkey.Valkey):
         assert await r.setex("a", 60, "1")

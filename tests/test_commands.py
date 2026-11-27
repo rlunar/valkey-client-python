@@ -88,6 +88,105 @@ class TestResponseCallbacks:
         assert r.response_callbacks["ping"] == r.response_callbacks["PING"]
 
 
+class TestConditionalStringCommandsUnit:
+    """Server-free tests for the arguments SET and DELEX send.
+
+    ``execute_command`` is mocked, so no connection is ever opened.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        client = valkey.Valkey()
+        with mock.patch.object(client, "execute_command") as execute_command:
+            yield client, execute_command
+
+    def test_set_ifeq_args(self, client):
+        c, execute_command = client
+        c.set("k", "new", ifeq="old")
+        execute_command.assert_called_once_with("SET", "k", "new", "IFEQ", "old")
+
+    def test_set_ifne_args(self, client):
+        c, execute_command = client
+        c.set("k", "new", ifne="old")
+        execute_command.assert_called_once_with("SET", "k", "new", "IFNE", "old")
+
+    def test_set_ifeq_with_expiry_and_get(self, client):
+        c, execute_command = client
+        c.set("k", "new", ex=datetime.timedelta(seconds=10), ifeq=b"old", get=True)
+        execute_command.assert_called_once_with(
+            "SET", "k", "new", "EX", 10, "IFEQ", b"old", "GET", get=True
+        )
+
+    def test_set_comparison_value_passed_unchanged(self, client):
+        c, execute_command = client
+        c.set("k", 2, ifeq=1)
+        execute_command.assert_called_once_with("SET", "k", 2, "IFEQ", 1)
+
+    def test_set_positional_arguments_unchanged(self, client):
+        # ifeq/ifne are appended after pxat, so positional callers keep working.
+        c, execute_command = client
+        c.set("k", "v", 10, None, True)
+        execute_command.assert_called_once_with("SET", "k", "v", "EX", 10, "NX")
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            {"nx": True, "xx": True},
+            {"nx": True, "ifeq": "a"},
+            {"nx": True, "ifne": "a"},
+            {"xx": True, "ifeq": "a"},
+            {"xx": True, "ifne": "a"},
+            {"ifeq": "a", "ifne": "b"},
+        ],
+    )
+    def test_set_conflicting_conditions_not_sent(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="mutually exclusive"):
+            c.set("k", "v", **conditions)
+        execute_command.assert_not_called()
+
+    def test_set_empty_comparison_value_is_sent(self, client):
+        # An empty string is a valid comparison value, unlike None.
+        c, execute_command = client
+        c.set("k", "v", ifeq="")
+        execute_command.assert_called_once_with("SET", "k", "v", "IFEQ", "")
+
+    def test_delex_ifeq_args(self, client):
+        c, execute_command = client
+        c.delex("k", ifeq="v")
+        execute_command.assert_called_once_with("DELEX", "k", "IFEQ", "v")
+
+    def test_delex_ifne_args(self, client):
+        c, execute_command = client
+        c.delex("k", ifne=b"v")
+        execute_command.assert_called_once_with("DELEX", "k", "IFNE", b"v")
+
+    def test_delex_empty_comparison_value_is_sent(self, client):
+        c, execute_command = client
+        c.delex("k", ifeq="")
+        execute_command.assert_called_once_with("DELEX", "k", "IFEQ", "")
+
+    @pytest.mark.parametrize("conditions", [{}, {"ifeq": "a", "ifne": "b"}])
+    def test_delex_requires_exactly_one_condition(self, client, conditions):
+        c, execute_command = client
+        with pytest.raises(exceptions.DataError, match="Exactly one"):
+            c.delex("k", **conditions)
+        execute_command.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response, options, expected",
+        [
+            (b"OK", {}, True),
+            (None, {}, None),  # condition not met
+            (b"old", {"get": True}, b"old"),  # GET returns the previous value
+            (None, {"get": True}, None),
+        ],
+    )
+    def test_set_reply_parsing(self, response, options, expected):
+        callback = _ValkeyCallbacks["SET"]
+        assert callback(response, **options) == expected
+
+
 class TestValkeyCommands:
     @pytest.mark.onlynoncluster
     @pytest.mark.standalone_exclusive
@@ -1206,6 +1305,36 @@ class TestValkeyCommands:
         assert r.get("a") is None
         assert r.get("b") is None
 
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_ifeq(self, r):
+        assert r.delex("a", ifeq="foo") == 0
+        r["a"] = "foo"
+        assert r.delex("a", ifeq="bar") == 0
+        assert r.get("a") == b"foo"
+        assert r.delex("a", ifeq="foo") == 1
+        assert r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_ifne(self, r):
+        assert r.delex("a", ifne="foo") == 0
+        r["a"] = "foo"
+        assert r.delex("a", ifne="foo") == 0
+        assert r.get("a") == b"foo"
+        assert r.delex("a", ifne="bar") == 1
+        assert r.get("a") is None
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_delex_wrong_type(self, r):
+        r.rpush("a", "foo")
+        with pytest.raises(exceptions.ResponseError):
+            r.delex("a", ifeq="foo")
+
+    def test_delex_requires_one_condition(self, r):
+        with pytest.raises(exceptions.DataError):
+            r.delex("a")
+        with pytest.raises(exceptions.DataError):
+            r.delex("a", ifeq="foo", ifne="bar")
+
     def test_delitem(self, r):
         r["a"] = "foo"
         del r["a"]
@@ -1793,6 +1922,50 @@ class TestValkeyCommands:
         assert r.set("a", "foo") is True
         assert r.set("a", "bar", get=True) == b"foo"
         assert r.get("a") == b"bar"
+
+    def test_set_conditions_mutually_exclusive(self, r):
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", nx=True, xx=True)
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", nx=True, ifeq="0")
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", xx=True, ifne="0")
+        with pytest.raises(exceptions.DataError):
+            r.set("a", "1", ifeq="0", ifne="0")
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq(self, r):
+        assert r.set("a", "1", ifeq="0") is None
+        assert r.get("a") is None
+        r["a"] = "1"
+        assert r.set("a", "2", ifeq="0") is None
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifeq="1") is True
+        assert r.get("a") == b"2"
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq_get_and_expiry(self, r):
+        r["a"] = "1"
+        assert r.set("a", "2", ifeq="0", get=True) == b"1"
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifeq="1", get=True, ex=10) == b"1"
+        assert r.get("a") == b"2"
+        assert 0 < r.ttl("a") <= 10
+
+    @skip_if_server_version_lt("8.1.0")
+    def test_set_ifeq_wrong_type(self, r):
+        r.rpush("a", "1")
+        with pytest.raises(exceptions.ResponseError):
+            r.set("a", "2", ifeq="1")
+
+    @skip_if_server_version_lt("9.2.0")
+    def test_set_ifne(self, r):
+        assert r.set("a", "1", ifne="0") is True
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifne="1") is None
+        assert r.get("a") == b"1"
+        assert r.set("a", "2", ifne="0") is True
+        assert r.get("a") == b"2"
 
     def test_setex(self, r):
         assert r.setex("a", 60, "1")
